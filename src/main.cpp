@@ -53,7 +53,7 @@ void loop() {
   // S1_A1_E1 verisi 10 kanallı olduğu için input->dims->data[1] kullanıyoruz
   for (int i = 0; i < input->dims->data[1]; i++) { 
     float ham_veri = test_data[current_sample_index][i];
-    
+    float islenmis_veri = ham_veri * 10.0;
     // Model tipine göre (INT8 veya FLOAT) veriyi yerleştir
     if (input->type == kTfLiteInt8) {
       int8_t quant_value = (int8_t)(ham_veri / input->params.scale + input->params.zero_point);
