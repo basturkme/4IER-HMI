@@ -1,89 +1,123 @@
 import serial
 import matplotlib.pyplot as plt
-from collections import deque
+import matplotlib.animation as animation
+import re
+import collections
+import threading
 import time
 
 # --- AYARLAR ---
-PORT = 'COM3'         # Windows için COM3, Mac için /dev/tty...
+PORT = 'COM3'   # Arduino'nun bağlı olduğu portu kontrol et!
 BAUD_RATE = 115200
-X_LEN = 200           # Ekranda gösterilecek veri nokta sayısı
+X_LEN = 300     # Ekranda gösterilecek veri noktası sayısı
 
-# Seri portu başlat
-try:
-    ser = serial.Serial(PORT, BAUD_RATE)
-    print(f"Baglanti basarili: {PORT}")
-except Exception as e:
-    print(f"HATA: Port acilamadi. {e}")
-    exit()
+# --- GLOBAL DEĞİŞKENLER ---
+# Yeni etiketlere göre değişken isimlerini güncelledik
+data_rest = collections.deque([0] * X_LEN, maxlen=X_LEN)
+data_index = collections.deque([0] * X_LEN, maxlen=X_LEN)   # Eskiden Fist idi
+data_middle = collections.deque([0] * X_LEN, maxlen=X_LEN)  # Eskiden Finger idi
 
-# Veri havuzları (Deque)
-y_signal = deque([0] * X_LEN, maxlen=X_LEN)  # Ham Sinyal
-y_class  = deque([0] * X_LEN, maxlen=X_LEN)  # Tahmin Edilen Sınıf (0, 1, 2...)
-y_conf   = deque([0] * X_LEN, maxlen=X_LEN)  # Güven Oranı (Opsiyonel)
+x_data = list(range(X_LEN))
+is_running = True
+current_status = "Bekleniyor..."
 
-# Grafik Ayarları (2 Alt Grafik: Üstte Sinyal, Altta Tahmin)
-plt.ion()
-fig, (ax1, ax2) = plt.subplots(2, 1, sharex=True, figsize=(10, 8))
+def read_serial_data():
+    global current_status, is_running
+    try:
+        ser = serial.Serial(PORT, BAUD_RATE, timeout=1)
+        print(f"{PORT} portuna bağlanıldı.")
+        time.sleep(2) # Arduino reset sonrası toparlasın diye bekleme
+    except Exception as e:
+        print(f"Port hatası: {e}")
+        is_running = False
+        return
 
-# 1. Grafik: EMG Sinyali
-line_signal, = ax1.plot(y_signal, color='green', label='EMG Girisi', alpha=0.7)
-ax1.set_ylabel("Sinyal Genligi")
-ax1.legend(loc='upper right')
-ax1.grid(True, alpha=0.3)
-
-# 2. Grafik: Tahmin Edilen Hareket (Classification)
-line_class, = ax2.plot(y_class, color='blue', label='Tahmin Edilen Sinif', linewidth=2)
-ax2.set_ylabel("Hareket No (Class ID)")
-ax2.set_xlabel("Zaman (Ornek)")
-ax2.set_ylim(-1, 13) # 0'dan 12'ye kadar sınıflarınız olduğu için aralığı geniş tuttum
-ax2.legend(loc='upper right')
-ax2.grid(True, alpha=0.3)
-
-print("Veri bekleniyor... (Grafik penceresi acilacak)")
-
-while True:
-    if ser.in_waiting:
+    while is_running:
         try:
-            # Satırı oku ve temizle
-            line = ser.readline().decode('utf-8', errors='ignore').strip()
-            
-            # BOŞ veya BİLGİ MESAJLARINI ATLA
-            # Eğer satır sayı ile başlamıyorsa veya içinde virgül yoksa atla
-            if not line or "," not in line:
-                # Debug için ekrana yazdırabiliriz (Opsiyonel)
-                # print(f"Bilgi Mesaji: {line}") 
-                continue
-            
-            parts = line.split(',')
-            
-            # Tam olarak 3 parça veri bekliyoruz (Sinyal, Sınıf, Güven)
-            if len(parts) == 3:
-                val_signal = float(parts[0]) # Sinyal
-                val_class  = int(parts[1])   # Sınıf (0, 1, 2...)
-                val_conf   = float(parts[2]) # Güven (0.0 - 1.0)
-
-                # Listelere ekle
-                y_signal.append(val_signal)
-                y_class.append(val_class)
+            if ser.in_waiting:
+                line = ser.readline().decode('utf-8', errors='ignore').strip()
                 
-                # Çizgileri güncelle
-                line_signal.set_ydata(y_signal)
-                line_class.set_ydata(y_class)
+                # --- KRİTİK GÜNCELLEME: REGEX ---
+                # Gelen Veri Formatı: "Rest:0.83,Index:0.09,Middle:0.08"
+                match = re.search(r"Rest:([0-9\.]+),Index:([0-9\.]+),Middle:([0-9\.]+)", line)
                 
-                # Eksenleri otomatik ölçekle (Sinyal sürekli değiştiği için)
-                ax1.relim()
-                ax1.autoscale_view(scalex=False, scaley=True)
-                
-                # Çizimi yenile
-                plt.pause(0.001) 
-                
-                # Konsola da yazdır ki aktığını görelim
-                print(f"Sinyal: {val_signal:.2f} | Hareket: {val_class} | Guven: %{val_conf*100:.1f}")
-                
-        except ValueError:
-            # Bazen veri bozuk gelebilir, program çökmesin diye pas geçiyoruz
-            continue
-        except KeyboardInterrupt:
-            print("Cikis yapiliyor...")
-            ser.close()
+                if match:
+                    try:
+                        val_rest = float(match.group(1))
+                        val_index = float(match.group(2))
+                        val_middle = float(match.group(3))
+                        
+                        data_rest.append(val_rest)
+                        data_index.append(val_index)
+                        data_middle.append(val_middle)
+                        
+                        # Durum Belirleme (Eşik Değeri: 0.5)
+                        if val_rest > 0.6: 
+                            current_status = "DINLENME (REST)"
+                        elif val_index > 0.6: 
+                            current_status = "ISARET PARMAGI (INDEX)"
+                        elif val_middle > 0.6: 
+                            current_status = "ORTA PARMAK (MIDDLE)"
+                        else: 
+                            current_status = "Belirsiz..."
+                    except ValueError:
+                        pass # Hatalı float dönüşümü olursa atla
+                    
+        except Exception as e:
+            print(f"Okuma hatası: {e}")
             break
+            
+    if ser.is_open:
+        ser.close()
+        print("Port kapatıldı.")
+
+# --- GRAFİK AYARLARI ---
+fig, ax = plt.subplots(figsize=(12, 6))
+plt.subplots_adjust(bottom=0.2) # Alttaki yazı için yer aç
+
+# Renkler: Yeşil(Rest), Mavi(Index), Kırmızı(Middle)
+line_rest, = ax.plot(x_data, data_rest, color='green', label='Rest', alpha=0.6, linestyle='--')
+line_index, = ax.plot(x_data, data_index, color='blue', label='Index (İşaret)', linewidth=2)
+line_middle, = ax.plot(x_data, data_middle, color='red', label='Middle (Orta)', linewidth=2)
+
+ax.set_ylim(-0.1, 1.1)
+ax.set_title("Canlı EMG Sınıflandırma (3 Sınıf)")
+ax.set_ylabel("Olasılık (0-1)")
+ax.legend(loc='upper left')
+ax.grid(True, alpha=0.3)
+
+# Durum Yazısı
+status_text = ax.text(0.5, -0.15, "Bekleniyor...", transform=ax.transAxes, 
+                      ha="center", fontsize=16, fontweight='bold', color='black')
+
+def update(frame):
+    # Çizgileri güncelle
+    line_rest.set_ydata(data_rest)
+    line_index.set_ydata(data_index)
+    line_middle.set_ydata(data_middle)
+    
+    # Durum yazısını güncelle ve renklendir
+    status_text.set_text(current_status)
+    
+    if "INDEX" in current_status:
+        status_text.set_color('blue')
+    elif "MIDDLE" in current_status:
+        status_text.set_color('red')
+    else:
+        status_text.set_color('green')
+
+    return line_rest, line_index, line_middle, status_text
+
+# Thread Başlat (Veri okuma arka planda dönsün)
+thread = threading.Thread(target=read_serial_data)
+thread.daemon = True
+thread.start()
+
+# Animasyonu Başlat
+print("Grafik açılıyor...")
+ani = animation.FuncAnimation(fig, update, interval=50, blit=True)
+plt.show()
+
+# Kapatılınca döngüyü durdur
+is_running = False
+thread.join()

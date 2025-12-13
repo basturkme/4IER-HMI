@@ -1,118 +1,165 @@
 #include <Arduino.h>
-#include <TensorFlowLite_ESP32.h> 
 
-// MODEL VERİSİ (Header dosyanızın adı neyse onu include edin)
-#include "emg_model_data.h"     
-// TEST VERİSİ 
-#include "test_vectors.h"     
-// TFLite Kütüphaneleri
+// --- LIBRARIES ---
 #include "tensorflow/lite/micro/all_ops_resolver.h"
-#include "tensorflow/lite/micro/micro_error_reporter.h"
 #include "tensorflow/lite/micro/micro_interpreter.h"
 #include "tensorflow/lite/schema/schema_generated.h"
+// ERROR REPORTER IS REQUIRED FOR MOST TFLITE VERSIONS TO AVOID CRASHES
+#include "tensorflow/lite/micro/micro_error_reporter.h"
 
-// --- GLOBALLER ---
+// Model and Test Data
+#include "robust_emg_model_data.h"
+#include "test_vectors.h"
+
+// --- SETTINGS ---
+const float FILTER_ALPHA = 0.2f; 
+const float THRESHOLD = 0.2f; 
+
+// --- GLOBAL VARIABLES ---
 const tflite::Model* model = nullptr;
 tflite::MicroInterpreter* interpreter = nullptr;
+tflite::ErrorReporter* error_reporter = nullptr; // Added Error Reporter
+
+// --- MEMORY SETTINGS ---
+// 25KB is usually safe for EMG models.
+// alignas(16) IS MANDATORY for ESP32/TFLite to prevent memory alignment crashes.
+constexpr int kTensorArenaSize = 25 * 1024; 
+alignas(16) uint8_t tensor_arena[kTensorArenaSize];
+
 TfLiteTensor* input = nullptr;
 TfLiteTensor* output = nullptr;
 
-const int kTensorArenaSize = 4 * 1024; 
-uint8_t tensor_arena[kTensorArenaSize];
+float filtered_probability = 0.0f; 
 
 void setup() {
   Serial.begin(115200);
-  
-  // 1. Model Yükle
-  model = tflite::GetModel(emg_model_data);
+  delay(2000); 
+  Serial.println("=== SYSTEM STARTING ===");
+  Serial.flush();
+
+  // 1. Setup Error Reporter
+  // This is critical. Passing nullptr to interpreter often causes abort() inside the constructor.
   static tflite::MicroErrorReporter micro_error_reporter;
+  error_reporter = &micro_error_reporter;
+  Serial.println("1. Error Reporter Setup... OK");
+
+  // 2. Load Model
+  Serial.print("2. Loading Model... ");
+  model = tflite::GetModel(emg_model_data);
+  if (model == nullptr) {
+    Serial.println("ERROR: Model data is NULL!");
+    while(1);
+  }
+  Serial.println("OK.");
+
+  // 3. Schema Check
+  Serial.print("3. Checking Schema... ");
+  if (model->version() != TFLITE_SCHEMA_VERSION) {
+    Serial.println("ERROR: Schema version mismatch!");
+    while(1); 
+  }
+  Serial.println("OK.");
+
+  // 4. Create Resolver
+  Serial.print("4. Creating Resolver... ");
   static tflite::AllOpsResolver resolver;
-  static tflite::MicroInterpreter static_interpreter(
-      model, resolver, tensor_arena, kTensorArenaSize, &micro_error_reporter);
-  interpreter = &static_interpreter;
-  interpreter->AllocateTensors();
+  Serial.println("OK.");
   
+  // 5. Setup Interpreter
+  Serial.print("5. Setting up Interpreter... ");
+  
+  // CRITICAL FIX: Passing 'error_reporter' instead of nullptr.
+  // Many TFLite versions crash if this is missing.
+  interpreter = new tflite::MicroInterpreter(
+      model, resolver, tensor_arena, kTensorArenaSize, error_reporter);
+  
+  if (interpreter == nullptr) {
+    Serial.println("ERROR: Failed to allocate Interpreter (Heap full?)");
+    while(1);
+  }
+  Serial.println("OK.");
+  Serial.flush();
+
+  // 6. Allocate Tensors
+  Serial.print("6. Allocating Tensors... ");
+  TfLiteStatus allocate_status = interpreter->AllocateTensors();
+  if (allocate_status != kTfLiteOk) {
+    Serial.println("\nERROR: AllocateTensors() failed!");
+    Serial.println("Likely kTensorArenaSize is too small.");
+    while(1);
+  }
+  Serial.println("OK.");
+  
+  Serial.print("Arena used bytes: ");
+  Serial.println(interpreter->arena_used_bytes());
+  Serial.flush();
+
+  // 7. Get Input/Output Pointers
   input = interpreter->input(0);
   output = interpreter->output(0);
   
-  Serial.println("--- SINYAL TARAMA TESTI BASLIYOR ---");
+  if (input == nullptr || output == nullptr) {
+     Serial.println("ERROR: Input or Output tensor is NULL!");
+     while(1);
+  }
   
-  // TANI: Modelin beklediği veri tipi nedir?
-  // 1 = FLOAT32, 9 = INT8
-  Serial.print("Model Input Tipi (1=FLOAT, 9=INT8): ");
-  Serial.println(input->type);
+  Serial.println("=== SETUP COMPLETE. STARTING LOOP ===");
+  delay(1000);
 }
-// Global değişken olarak sayacı ekleyelim (loop'un dışına veya static olarak içine)
-int current_sample_index = 0; 
 
 void loop() {
-  // 1. TEST VERİSİNİ SEÇ
-  // test_data'dan o anki satırı okuyoruz
-  
-  // 2. INPUT TENSORUNU DOLDUR
-  // S1_A1_E1 verisi 10 kanallı olduğu için input->dims->data[1] kullanıyoruz
-  for (int i = 0; i < input->dims->data[1]; i++) { 
-    float ham_veri = test_data[current_sample_index][i];
-    float islenmis_veri = ham_veri * 10.0;
-    // Model tipine göre (INT8 veya FLOAT) veriyi yerleştir
-    if (input->type == kTfLiteInt8) {
-      int8_t quant_value = (int8_t)(ham_veri / input->params.scale + input->params.zero_point);
-      input->data.int8[i] = quant_value;
-    } else {
-       input->data.f[i] = ham_veri;
-    }
-  }
 
-  // 3. TAHMİN (Inference)
-  TfLiteStatus invoke_status = interpreter->Invoke();
-  if (invoke_status != kTfLiteOk) {
-    Serial.println("Invoke failed!");
-    return;
-  }
+  for (int i = 0; i < TEST_DATA_LEN; i++) {
 
-  // 4. ÇIKTILARI AL (CLASSIFICATION LOGIC - DÜZELTİLEN KISIM)
-  float max_probability = 0.0;
-  int predicted_class = -1;
-  
-  // Çıktı katmanının boyutunu (sınıf sayısını) al
-  int num_classes = output->dims->data[1]; 
+   
 
-  // Tüm sınıfları tara ve en yüksek olasılığı bul
-  for (int i = 0; i < num_classes; i++) {
-    float probability;
-    
-    if (output->type == kTfLiteInt8) {
-       probability = (output->data.int8[i] - output->params.zero_point) * output->params.scale;
-    } else {
-       probability = output->data.f[i];
+    input->data.f[0] = test_data[i][0];
+
+    input->data.f[1] = test_data[i][1];
+
+    input->data.f[2] = test_data[i][2];
+
+    input->data.f[3] = test_data[i][3];
+
+
+
+    // ... inside loop() ...
+
+    if (interpreter->Invoke() != kTfLiteOk) {
+      Serial.println("ERROR: Invoke failed!");
+      return;
     }
 
-    if (probability > max_probability) {
-      max_probability = probability;
-      predicted_class = i;
+    // Now this works because the model actually has 3 outputs
+    float prob_rest   = output->data.f[0]; // Class 0
+    float prob_index  = output->data.f[1]; // Class 1
+    float prob_middle = output->data.f[2]; // Class 2
+
+    // Logic to find the winner
+    float max_prob = prob_rest;
+    int predicted_class = 0; 
+
+    if (prob_index > max_prob) {
+        max_prob = prob_index;
+        predicted_class = 1;
     }
+    if (prob_middle > max_prob) {
+        max_prob = prob_middle;
+        predicted_class = 2;
+    }
+
+    // Visualization compatible format
+    Serial.print("Rest:"); Serial.print(prob_rest);
+    Serial.print(",Index:"); Serial.print(prob_index);
+    Serial.print(",Middle:"); Serial.println(prob_middle);
+
+// ...
+       
+
+    delay(50);
+
   }
-
-  // 5. SERİ PORTA YAZDIR (HATANIN ÇÖZÜMÜ)
-  // Artık prob_0 veya prob_1 yok. "Tahmin Edilen Sınıf" ve "Güven Oranı" var.
-  
-  // 1. Değer: Sinyal (Görsel referans için)
-  Serial.print(test_data[current_sample_index][0] * 10); 
-  Serial.print(",");
-  
-  // 2. Değer: Tahmin Edilen Hareket (0, 1, 2, ... 12)
-  Serial.print(predicted_class); 
-  Serial.print(",");
-  
-  // 3. Değer: Güven Oranı (0.0 - 1.0 arası)
-  Serial.println(max_probability);
-
-  // 6. BİR SONRAKİ VERİYE GEÇ
-  current_sample_index++;
-  
-  if (current_sample_index >= TEST_DATA_LEN) {
-    current_sample_index = 0;
-  }
-
-  delay(50); 
+  filtered_probability = 0.0f; 
+  Serial.println("\n--- Loop Restarting ---\n");
+  delay(2000);
 }
