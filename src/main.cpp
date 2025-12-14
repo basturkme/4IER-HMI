@@ -149,6 +149,7 @@ void loop() {
     }
 
     // Visualization compatible format
+    Serial.print("Test:"); Serial.print(test_data[i][0]);
     Serial.print("Rest:"); Serial.print(prob_rest);
     Serial.print(",Index:"); Serial.print(prob_index);
     Serial.print(",Middle:"); Serial.println(prob_middle);
